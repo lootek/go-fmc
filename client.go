@@ -46,6 +46,8 @@ type Client struct {
 	authToken string
 	// Refresh token is the current authentication token
 	refreshToken string
+	// Token generation counter - incremented on each auth/refresh
+	tokenGeneration int64
 	// UserAgent is the HTTP User-Agent string
 	UserAgent string
 	// Usr is the FMC username. Not used for cdFMC.
@@ -279,13 +281,13 @@ func (client *Client) NewReq(method, uri string, body io.Reader, mods ...func(*R
 //	req := client.NewReq("GET", "/api/fmc_config/v1/domain/{DOMAIN_UUID}/object/networks", nil)
 //	res, _ := client.Do(req)
 func (client *Client) Do(req Req) (Res, error) {
-	err := client.Authenticate("")
+	err := client.Authenticate()
 	if err != nil {
 		return Res{}, err
 	}
 
-	// Save current auth token. In case of 401, we can check if the token has changed in the meantime
-	authToken := client.AuthToken()
+	// Get current token and generation
+	authToken, tokenGen := client.AuthToken()
 	if client.IsCDFMC {
 		req.HttpReq.Header.Add("Authorization", "Bearer "+client.Pwd)
 	} else {
@@ -351,15 +353,24 @@ func (client *Client) Do(req Req) (Res, error) {
 					log.Printf("[DEBUG] [ReqID: %s] Invalid session detected. Retrying...", req.RequestID)
 					continue
 				}
-				log.Printf("[DEBUG] [ReqID: %s] Invalid session detected. Reauthenticating...", req.RequestID)
-				err := client.Authenticate(authToken)
-				if err != nil {
-					log.Printf("[DEBUG] [ReqID: %s] HTTP Request failed: StatusCode 401: Reauthentication failed with StatusCode (%d): %s", req.RequestID, httpRes.StatusCode, err.Error())
-					return res, fmt.Errorf("HTTP Request failed: StatusCode 401: Reauthentication failed with StatusCode (%d): %s", httpRes.StatusCode, err.Error())
+
+				// Check if we should reauthenticate
+				if client.shouldReauthenticate(tokenGen) {
+					log.Printf("[DEBUG] [ReqID: %s] Invalid session detected. Reauthenticating...", req.RequestID)
+					err := client.reauthenticate()
+					if err != nil {
+						log.Printf("[DEBUG] [ReqID: %s] HTTP Request failed: StatusCode 401: Reauthentication failed: %s", req.RequestID, err.Error())
+						return res, fmt.Errorf("HTTP Request failed: StatusCode 401: Reauthentication failed: %s", err.Error())
+					}
+					// Get new token for retry
+					authToken, tokenGen = client.AuthToken()
+					req.HttpReq.Header.Set("X-auth-access-token", authToken)
+				} else {
+					log.Printf("[DEBUG] [ReqID: %s] Token already refreshed by another thread", req.RequestID)
+					// Get the updated token
+					authToken, tokenGen = client.AuthToken()
+					req.HttpReq.Header.Set("X-auth-access-token", authToken)
 				}
-				// Save authentication token in case next 401 is received
-				authToken = client.AuthToken()
-				req.HttpReq.Header.Set("X-auth-access-token", authToken)
 				continue
 			} else if desc := res.Get("error.messages.0.description"); desc.Exists() {
 				// FMC may return HTTP response code 400 with advice to retry the operation
@@ -537,6 +548,7 @@ func (client *Client) login() error {
 
 		client.authToken = httpRes.Header.Get("X-auth-access-token")
 		client.refreshToken = httpRes.Header.Get("X-auth-refresh-token")
+		client.tokenGeneration++ // Increment generation on successful login
 		client.LastRefresh = time.Now()
 		client.RefreshCount = 0
 		client.DomainUUID = httpRes.Header.Get("DOMAIN_UUID")
@@ -585,6 +597,7 @@ func (client *Client) refresh() error {
 
 		client.authToken = httpRes.Header.Get("X-auth-access-token")
 		client.refreshToken = httpRes.Header.Get("X-auth-refresh-token")
+		client.tokenGeneration++ // Increment generation on successful refresh
 		client.LastRefresh = time.Now()
 		client.RefreshCount = client.RefreshCount + 1
 		client.DomainUUID = httpRes.Header.Get("DOMAIN_UUID")
@@ -594,19 +607,21 @@ func (client *Client) refresh() error {
 	}
 }
 
-// AuthToken returns the current token
-func (client *Client) AuthToken() string {
+// AuthToken returns the current token and its generation
+func (client *Client) AuthToken() (string, int64) {
 	client.authenticationMutex.RLock()
 	defer client.authenticationMutex.RUnlock()
-
-	return client.authToken
+	return client.authToken, client.tokenGeneration
 }
 
-// Authenticate assures the token is there and valid.
-// It will try to login/refresh the token based on the current state and information from FMC on failures.
-// invalidAuthToken is the token used in the request, that was rejected by FMC. This helps to
-// determine, if failed token needs refreshing or has already been refreshed by other thread.
-func (client *Client) Authenticate(invalidAuthToken string) error {
+// AuthTokenString returns just the token (for backward compatibility)
+func (client *Client) AuthTokenString() string {
+	token, _ := client.AuthToken()
+	return token
+}
+
+// Authenticate ensures the token is valid and available
+func (client *Client) Authenticate() error {
 	// cdFMC uses fixed token to authenticate
 	if client.IsCDFMC {
 		return nil
@@ -615,30 +630,34 @@ func (client *Client) Authenticate(invalidAuthToken string) error {
 	client.authenticationMutex.Lock()
 	defer client.authenticationMutex.Unlock()
 
-	if client.authToken != "" && invalidAuthToken == "" {
-		// authToken is present, no error reported, do nothing
+	// If we have a token, assume it's valid until proven otherwise
+	if client.authToken != "" {
 		return nil
 	}
 
-	if invalidAuthToken != "" && invalidAuthToken != client.authToken {
-		// authToken has changed since the last request
-		// we assume some other thread has already refreshed it, do nothing
-		return nil
-	}
+	// No token available, do a full login
+	return client.login()
+}
 
-	if client.authToken == "" {
-		// No authToken, do a full login
-		return client.login()
-	}
+// shouldReauthenticate checks if we should attempt reauthentication
+// based on whether the token generation has changed
+func (client *Client) shouldReauthenticate(oldGeneration int64) bool {
+	client.authenticationMutex.RLock()
+	defer client.authenticationMutex.RUnlock()
+	return client.tokenGeneration == oldGeneration
+}
 
-	// We have the tokens, but FMC rejected them
-	// first check if we can refresh the tokens
+// reauthenticate forces a new authentication attempt
+func (client *Client) reauthenticate() error {
+	client.authenticationMutex.Lock()
+	defer client.authenticationMutex.Unlock()
+
+	// Try refresh first, then full login if that fails
 	err := client.refresh()
 	if err != nil {
-		// If refresh fails, do a full login
+		log.Printf("[DEBUG] Token refresh failed, attempting full login: %s", err.Error())
 		err = client.login()
 	}
-
 	return err
 }
 
