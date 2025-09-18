@@ -52,6 +52,7 @@ func testClient770() Client {
 func authenticatedTestClient() Client {
 	client := testClient()
 	client.authToken = "ABC"
+	client.tokenGeneration = 1
 	client.LastRefresh = time.Now()
 	client.RefreshCount = 0
 	client.DomainUUID = "ABC123"
@@ -184,6 +185,7 @@ func TestClientGetRetry(t *testing.T) {
 	// Create client
 	client, _ := NewClient(testURL, "usr", "pwd", CustomHttpClient(httpClient), MaxRetries(3), BackoffMinDelay(0))
 	client.authToken = "ABC"
+	client.tokenGeneration = 1
 	client.LastRefresh = time.Now()
 
 	// Request should fail
