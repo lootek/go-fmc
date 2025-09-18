@@ -357,20 +357,20 @@ func (client *Client) Do(req Req) (Res, error) {
 				// Check if we should reauthenticate
 				if client.shouldReauthenticate(tokenGen) {
 					log.Printf("[DEBUG] [ReqID: %s] Invalid session detected. Reauthenticating...", req.RequestID)
-					err := client.reauthenticate()
+					performed, err := client.reauthenticate(tokenGen)
 					if err != nil {
 						log.Printf("[DEBUG] [ReqID: %s] HTTP Request failed: StatusCode 401: Reauthentication failed: %s", req.RequestID, err.Error())
 						return res, fmt.Errorf("HTTP Request failed: StatusCode 401: Reauthentication failed: %s", err.Error())
 					}
-					// Get new token for retry
-					authToken, tokenGen = client.AuthToken()
-					req.HttpReq.Header.Set("X-auth-access-token", authToken)
+					if !performed {
+						log.Printf("[DEBUG] [ReqID: %s] Token already refreshed by another thread during reauthentication attempt", req.RequestID)
+					}
 				} else {
 					log.Printf("[DEBUG] [ReqID: %s] Token already refreshed by another thread", req.RequestID)
-					// Get the updated token
-					authToken, tokenGen = client.AuthToken()
-					req.HttpReq.Header.Set("X-auth-access-token", authToken)
 				}
+				// Get the updated token (regardless of who updated it)
+				authToken, tokenGen = client.AuthToken()
+				req.HttpReq.Header.Set("X-auth-access-token", authToken)
 				continue
 			} else if desc := res.Get("error.messages.0.description"); desc.Exists() {
 				// FMC may return HTTP response code 400 with advice to retry the operation
@@ -648,9 +648,16 @@ func (client *Client) shouldReauthenticate(oldGeneration int64) bool {
 }
 
 // reauthenticate forces a new authentication attempt
-func (client *Client) reauthenticate() error {
+// Returns true if reauthentication was performed, false if another thread already did it
+func (client *Client) reauthenticate(expectedGeneration int64) (bool, error) {
 	client.authenticationMutex.Lock()
 	defer client.authenticationMutex.Unlock()
+
+	// Double-check: has another thread already refreshed the token?
+	if client.tokenGeneration != expectedGeneration {
+		log.Printf("[DEBUG] Token already refreshed by another thread (expected: %d, current: %d)", expectedGeneration, client.tokenGeneration)
+		return false, nil
+	}
 
 	// Try refresh first, then full login if that fails
 	err := client.refresh()
@@ -658,7 +665,7 @@ func (client *Client) reauthenticate() error {
 		log.Printf("[DEBUG] Token refresh failed, attempting full login: %s", err.Error())
 		err = client.login()
 	}
-	return err
+	return true, err
 }
 
 // Backoff waits following an exponential backoff algorithm
