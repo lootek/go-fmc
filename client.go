@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/go-version"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
@@ -42,9 +43,9 @@ type Client struct {
 	// Url is the FMC IP or hostname, e.g. https://10.0.0.1:443 (port is optional).
 	Url string
 	// Authentication token is the current authentication token
-	AuthToken string
+	authToken string
 	// Refresh token is the current authentication token
-	RefreshToken string
+	refreshToken string
 	// UserAgent is the HTTP User-Agent string
 	UserAgent string
 	// Usr is the FMC username. Not used for cdFMC.
@@ -61,8 +62,6 @@ type Client struct {
 	BackoffMaxDelay int
 	// Backoff delay factor
 	BackoffDelayFactor float64
-	// Authentication mutex
-	authenticationMutex *sync.Mutex
 	// LastRefresh is the timestamp of the last authentication token refresh
 	LastRefresh time.Time
 	// RefreshCount is the number to authentication token refreshes with the same refresh token
@@ -71,13 +70,16 @@ type Client struct {
 	DomainUUID string
 	// Map of domain names to domain UUIDs.
 	Domains map[string]string
-	// FMC Version
+	// FMC Version string as returned by FMC - ex. 7.7.0 (build 91)
 	FMCVersion string
+	// FMC Version parsed to go-version library - ex. 7.7.0
+	FMCVersionParsed *version.Version
 	// Is this cdFMC connection
 	IsCDFMC bool
-
+	// Rate limit requests to FMC
 	RateLimiterBucket *ratelimit.Bucket
-
+	// Authentication mutex
+	authenticationMutex *sync.RWMutex
 	// writingMutex protects against concurrent DELETE/POST/PUT requests towards the API.
 	writingMutex *sync.Mutex
 }
@@ -109,8 +111,8 @@ func NewClient(url, usr, pwd string, mods ...func(*Client)) (Client, error) {
 		BackoffMinDelay:     DefaultBackoffMinDelay,
 		BackoffMaxDelay:     DefaultBackoffMaxDelay,
 		BackoffDelayFactor:  DefaultBackoffDelayFactor,
-		authenticationMutex: &sync.Mutex{},
 		RateLimiterBucket:   ratelimit.NewBucketWithRate(1.97, 1), // 1.97 req/s ~= 118 req/min (+/- 1% from 120 req/min that FMC allows)
+		authenticationMutex: &sync.RWMutex{},
 		writingMutex:        &sync.Mutex{},
 	}
 
@@ -120,7 +122,23 @@ func NewClient(url, usr, pwd string, mods ...func(*Client)) (Client, error) {
 
 	err := client.GetFMCVersion()
 	if err != nil {
+		log.Printf("[ERROR] Failed to retrieve FMC version: %s", err.Error())
 		return client, err
+	}
+
+	// Compile FMC version to go-version
+	client.FMCVersionParsed, err = version.NewVersion(strings.Split(client.FMCVersion, " ")[0])
+	if err != nil {
+		log.Printf("[ERROR] Failed to parse FMC version (%s): %s", client.FMCVersion, err.Error())
+		return client, fmt.Errorf("failed to parse FMC version (%s): %s", client.FMCVersion, err.Error())
+	}
+
+	log.Printf("[INFO] FMC Version: %s, FMC Version Parsed: %s", client.FMCVersion, client.FMCVersionParsed.String())
+
+	// FMC 7.4.1, 6.6.0 and later have increased rate limits
+	if client.FMCVersionParsed.GreaterThanOrEqual(version.Must(version.NewVersion("7.4.1"))) {
+		log.Printf("[DEBUG] Increasing rate limit to 5 req/s (300 req/min)")
+		client.RateLimiterBucket = ratelimit.NewBucketWithRate(5, 1) // 5 req/s = 300 req/min
 	}
 
 	return client, nil
@@ -220,16 +238,22 @@ func cdFMC(x bool) func(*Client) {
 
 // NewReq creates a new Req request for this client.
 // Use a "{DOMAIN_UUID}" placeholder in the URI to be replaced with the domain UUID.
-func (client Client) NewReq(method, uri string, body io.Reader, mods ...func(*Req)) (Req, error) {
+func (client *Client) NewReq(method, uri string, body io.Reader, mods ...func(*Req)) (Req, error) {
 	httpReq, _ := http.NewRequest(method, client.Url+uri, body)
 	req := Req{
 		HttpReq:    httpReq,
 		LogPayload: true,
 		DomainName: "",
 	}
+
 	for _, mod := range mods {
 		mod(&req)
 	}
+
+	if req.RequestID == "" {
+		req.RequestID = generateRequestID(8)
+	}
+
 	if req.DomainName == "" {
 		req.HttpReq.URL.Path = strings.ReplaceAll(req.HttpReq.URL.Path, "{DOMAIN_UUID}", client.DomainUUID)
 	} else {
@@ -241,7 +265,7 @@ func (client Client) NewReq(method, uri string, body io.Reader, mods ...func(*Re
 				availableDomains[i] = k
 				i++
 			}
-			log.Printf("[ERROR] Requested domain not found: requested domain: %s, available domains: %s", req.DomainName, availableDomains)
+			log.Printf("[ERROR] [ReqID: %s] Requested domain not found: requested domain: %s, available domains: %s", req.RequestID, req.DomainName, availableDomains)
 			return Req{}, fmt.Errorf("requested domain not found: requested domain: %s, available domains: %s", req.DomainName, availableDomains)
 		}
 		req.HttpReq.URL.Path = strings.ReplaceAll(req.HttpReq.URL.Path, "{DOMAIN_UUID}", client.Domains[req.DomainName])
@@ -255,11 +279,17 @@ func (client Client) NewReq(method, uri string, body io.Reader, mods ...func(*Re
 //	req := client.NewReq("GET", "/api/fmc_config/v1/domain/{DOMAIN_UUID}/object/networks", nil)
 //	res, _ := client.Do(req)
 func (client *Client) Do(req Req) (Res, error) {
-	// add token
+	err := client.Authenticate("")
+	if err != nil {
+		return Res{}, err
+	}
+
+	// Save current auth token. In case of 401, we can check if the token has changed in the meantime
+	authToken := client.AuthToken()
 	if client.IsCDFMC {
 		req.HttpReq.Header.Add("Authorization", "Bearer "+client.Pwd)
 	} else {
-		req.HttpReq.Header.Add("X-auth-access-token", client.AuthToken)
+		req.HttpReq.Header.Add("X-auth-access-token", authToken)
 	}
 	req.HttpReq.Header.Add("Content-Type", "application/json")
 	req.HttpReq.Header.Add("Accept", "application/json")
@@ -276,56 +306,60 @@ func (client *Client) Do(req Req) (Res, error) {
 		httpRes, err := client.do(req, body)
 		if err != nil {
 			if ok := client.Backoff(attempts); !ok {
-				log.Printf("[ERROR] HTTP Connection error occured: %+v", err)
-				log.Printf("[DEBUG] Exit from Do method")
+				log.Printf("[ERROR] [ReqID: %s] HTTP Connection error occurred: %+v", req.RequestID, err)
+				log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
 				return Res{}, err
 			} else {
-				log.Printf("[ERROR] HTTP Connection failed: %s, retries: %v", err, attempts)
+				log.Printf("[ERROR] [ReqID: %s] HTTP Connection failed: %s, retries: %v", req.RequestID, err, attempts)
 				continue
 			}
 		}
 
-		defer httpRes.Body.Close()
 		bodyBytes, err := io.ReadAll(httpRes.Body)
+		httpRes.Body.Close()
 		if err != nil {
 			if ok := client.Backoff(attempts); !ok {
-				log.Printf("[ERROR] Cannot decode response body: %+v", err)
-				log.Printf("[DEBUG] Exit from Do method")
+				log.Printf("[ERROR] [ReqID: %s] Cannot decode response body: %+v", req.RequestID, err)
+				log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
 				return Res{}, err
 			} else {
-				log.Printf("[ERROR] Cannot decode response body: %s, retries: %v", err, attempts)
+				log.Printf("[ERROR] [ReqID: %s] Cannot decode response body: %s, retries: %v", req.RequestID, err, attempts)
 				continue
 			}
 		}
-		res = Res(gjson.ParseBytes(bodyBytes))
+		res = gjson.ParseBytes(bodyBytes)
 		if req.LogPayload {
-			log.Printf("[DEBUG] HTTP Response: %s", res.Raw)
+			log.Printf("[DEBUG] [ReqID: %s] HTTP Response (StatusCode %d): %s", req.RequestID, httpRes.StatusCode, res.Raw)
 		}
 
 		if httpRes.StatusCode >= 200 && httpRes.StatusCode <= 299 {
-			log.Printf("[DEBUG] Exit from Do method")
+			log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
 			break
 		} else {
 			if ok := client.Backoff(attempts); !ok {
-				log.Printf("[ERROR] HTTP Request failed: StatusCode %v", httpRes.StatusCode)
-				log.Printf("[DEBUG] Exit from Do method")
+				log.Printf("[ERROR] [ReqID: %s] HTTP Request failed: StatusCode %v", req.RequestID, httpRes.StatusCode)
+				log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
 				return res, fmt.Errorf("HTTP Request failed: StatusCode %v", httpRes.StatusCode)
 			} else if httpRes.StatusCode == 429 || (httpRes.StatusCode >= 500 && httpRes.StatusCode <= 599) {
-				log.Printf("[ERROR] HTTP Request failed: StatusCode %v, Retries: %v", httpRes.StatusCode, attempts)
+				log.Printf("[ERROR] [ReqID: %s] HTTP Request failed: StatusCode %v, Retries: %v", req.RequestID, httpRes.StatusCode, attempts)
 				continue
-			} else if httpRes.StatusCode == 401 && !client.IsCDFMC {
-				// There are bugs in FMC, where the sessions are invalidated out of the blue
-				// In case such a situation is detected, new authentication is forced
-				log.Printf("[DEBUG] Invalid session detected. Forcing reauthentication")
-				// Clear AuthToken (which is invalid anyways). This also ensures that Authenticate does full authentication
-				client.AuthToken = ""
-				// Force reauthentication, client.Authenticate() takes care of mutexes, hence not calling Login() directly
-				err := client.Authenticate()
-				if err != nil {
-					log.Printf("[DEBUG] HTTP Request failed: StatusCode 401: Forced reauthentication failed: %s", err.Error())
-					return res, fmt.Errorf("HTTP Request failed: StatusCode 401: Forced reauthentication failed: %s", err.Error())
+			} else if httpRes.StatusCode == 401 {
+				// When request fails with 401, this indicates invalid authentication tokens
+				// For cdFMC, we just retry the request as this may be glitch in cdFMC
+				// For FMC, we try to reauthenticate and retry the request
+				if client.IsCDFMC {
+					log.Printf("[DEBUG] [ReqID: %s] Invalid session detected. Retrying...", req.RequestID)
+					continue
 				}
-				req.HttpReq.Header.Set("X-auth-access-token", client.AuthToken)
+				log.Printf("[DEBUG] [ReqID: %s] Invalid session detected. Reauthenticating...", req.RequestID)
+				err := client.Authenticate(authToken)
+				if err != nil {
+					log.Printf("[DEBUG] [ReqID: %s] HTTP Request failed: StatusCode 401: Reauthentication failed with StatusCode (%d): %s", req.RequestID, httpRes.StatusCode, err.Error())
+					return res, fmt.Errorf("HTTP Request failed: StatusCode 401: Reauthentication failed with StatusCode (%d): %s", httpRes.StatusCode, err.Error())
+				}
+				// Save authentication token in case next 401 is received
+				authToken = client.AuthToken()
+				req.HttpReq.Header.Set("X-auth-access-token", authToken)
 				continue
 			} else if desc := res.Get("error.messages.0.description"); desc.Exists() {
 				// FMC may return HTTP response code 400 with advice to retry the operation
@@ -336,14 +370,14 @@ func (client *Client) Do(req Req) (Res, error) {
 				}
 			}
 			// In case any previous conditions don't `continue`, return error
-			log.Printf("[ERROR] HTTP Request failed: StatusCode %v", httpRes.StatusCode)
-			log.Printf("[DEBUG] Exit from Do method")
+			log.Printf("[ERROR] [ReqID: %s] HTTP Request failed: StatusCode %v", req.RequestID, httpRes.StatusCode)
+			log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
 			return res, fmt.Errorf("HTTP Request failed: StatusCode %v", httpRes.StatusCode)
 		}
 	}
 
 	if res.Get("error.messages.0").Exists() {
-		log.Printf("[ERROR] JSON error: %s", res.Get("error.messages.0").String())
+		log.Printf("[ERROR] [ReqID: %s] JSON error: %s", req.RequestID, res.Get("error.messages.0").String())
 		return res, fmt.Errorf("JSON error: %s", res.Get("error.messages.0").String())
 	}
 	return res, nil
@@ -359,9 +393,9 @@ func (client *Client) do(req Req, body []byte) (*http.Response, error) {
 
 	req.HttpReq.Body = io.NopCloser(bytes.NewBuffer(body))
 	if req.LogPayload {
-		log.Printf("[DEBUG] HTTP Request: %s, %s, %s", req.HttpReq.Method, req.HttpReq.URL, string(body))
+		log.Printf("[DEBUG] [ReqID: %s] HTTP Request: %s, %s, %s", req.RequestID, req.HttpReq.Method, req.HttpReq.URL, string(body))
 	} else {
-		log.Printf("[DEBUG] HTTP Request: %s, %s", req.HttpReq.Method, req.HttpReq.URL)
+		log.Printf("[DEBUG] [ReqID: %s] HTTP Request: %s, %s", req.RequestID, req.HttpReq.Method, req.HttpReq.URL)
 	}
 
 	return client.HttpClient.Do(req.HttpReq)
@@ -392,6 +426,9 @@ func (client *Client) Get(path string, mods ...func(*Req)) (Res, error) {
 	// Otherwise discard previous response and get all pages
 	offset := 0
 	fullOutput := `{"items":[]}`
+
+	// Generate Request ID for tracking all get requests under a single ID
+	mods = append(mods, RequestID(generateRequestID(8)))
 
 	// Lock writing mutex to make sure the pages are not changed during reading
 	client.writingMutex.Lock()
@@ -434,10 +471,6 @@ func (client *Client) Get(path string, mods ...func(*Req)) (Res, error) {
 // It does the exact request it is told to do.
 // Results will be the raw data structure as returned by FMC
 func (client *Client) get(path string, mods ...func(*Req)) (Res, error) {
-	err := client.Authenticate()
-	if err != nil {
-		return Res{}, err
-	}
 	req, err := client.NewReq("GET", path, nil, mods...)
 	if err != nil {
 		return Res{}, err
@@ -447,10 +480,6 @@ func (client *Client) get(path string, mods ...func(*Req)) (Res, error) {
 
 // Delete makes a DELETE request.
 func (client *Client) Delete(path string, mods ...func(*Req)) (Res, error) {
-	err := client.Authenticate()
-	if err != nil {
-		return Res{}, err
-	}
 	req, err := client.NewReq("DELETE", path, nil, mods...)
 	if err != nil {
 		return Res{}, err
@@ -461,10 +490,6 @@ func (client *Client) Delete(path string, mods ...func(*Req)) (Res, error) {
 // Post makes a POST request and returns a GJSON result.
 // Hint: Use the Body struct to easily create POST body data.
 func (client *Client) Post(path, data string, mods ...func(*Req)) (Res, error) {
-	err := client.Authenticate()
-	if err != nil {
-		return Res{}, err
-	}
 	req, err := client.NewReq("POST", path, strings.NewReader(data), mods...)
 	if err != nil {
 		return Res{}, err
@@ -475,10 +500,6 @@ func (client *Client) Post(path, data string, mods ...func(*Req)) (Res, error) {
 // Put makes a PUT request and returns a GJSON result.
 // Hint: Use the Body struct to easily create PUT body data.
 func (client *Client) Put(path, data string, mods ...func(*Req)) (Res, error) {
-	err := client.Authenticate()
-	if err != nil {
-		return Res{}, err
-	}
 	req, err := client.NewReq("PUT", path, strings.NewReader(data), mods...)
 	if err != nil {
 		return Res{}, err
@@ -486,8 +507,9 @@ func (client *Client) Put(path, data string, mods ...func(*Req)) (Res, error) {
 	return client.Do(req)
 }
 
-// Login authenticates to the FMC instance.
-func (client *Client) Login() error {
+// login authenticates to the FMC instance.
+// This function is not thread safe, use Authenticate() instead.
+func (client *Client) login() error {
 	for attempts := 0; ; attempts++ {
 		req, _ := client.NewReq("POST", "/api/fmc_platform/v1/auth/generatetoken", strings.NewReader(""), NoLogPayload)
 		req.HttpReq.Header.Add("User-Agent", client.UserAgent)
@@ -497,8 +519,8 @@ func (client *Client) Login() error {
 		if err != nil {
 			return err
 		}
-		defer httpRes.Body.Close()
 		bodyBytes, _ := io.ReadAll(httpRes.Body)
+		httpRes.Body.Close()
 		if httpRes.StatusCode != 204 {
 			log.Printf("[ERROR] Authentication failed: StatusCode %v", httpRes.StatusCode)
 			return fmt.Errorf("authentication failed, status code: %v", httpRes.StatusCode)
@@ -512,8 +534,9 @@ func (client *Client) Login() error {
 				continue
 			}
 		}
-		client.AuthToken = httpRes.Header.Get("X-auth-access-token")
-		client.RefreshToken = httpRes.Header.Get("X-auth-refresh-token")
+
+		client.authToken = httpRes.Header.Get("X-auth-access-token")
+		client.refreshToken = httpRes.Header.Get("X-auth-refresh-token")
 		client.LastRefresh = time.Now()
 		client.RefreshCount = 0
 		client.DomainUUID = httpRes.Header.Get("DOMAIN_UUID")
@@ -531,62 +554,93 @@ func (client *Client) Login() error {
 	}
 }
 
-// Refresh refreshes the authentication token.
-// Note that this will be handled automatically by default.
-// Refresh will be checked every request and the token will be refreshed after 25 minutes.
-func (client *Client) Refresh() error {
+// refresh refreshes the authentication token.
+// This function is not thread safe, use Authenticate() instead.
+func (client *Client) refresh() error {
 	for attempts := 0; ; attempts++ {
 		req, _ := client.NewReq("POST", "/api/fmc_platform/v1/auth/refreshtoken", strings.NewReader(""), NoLogPayload)
-		req.HttpReq.Header.Add("X-auth-access-token", client.AuthToken)
-		req.HttpReq.Header.Add("X-auth-refresh-token", client.RefreshToken)
+		req.HttpReq.Header.Add("X-auth-access-token", client.authToken)
+		req.HttpReq.Header.Add("X-auth-refresh-token", client.refreshToken)
 		req.HttpReq.Header.Add("User-Agent", client.UserAgent)
 		client.RateLimiterBucket.Wait(1)
 		httpRes, err := client.HttpClient.Do(req.HttpReq)
 		if err != nil {
 			return err
 		}
-		defer httpRes.Body.Close()
 		bodyBytes, _ := io.ReadAll(httpRes.Body)
+		httpRes.Body.Close()
 		if httpRes.StatusCode != 204 {
-			log.Printf("[ERROR] Authentication failed: StatusCode %v", httpRes.StatusCode)
-			return fmt.Errorf("authentication failed, status code: %v", httpRes.StatusCode)
+			log.Printf("[ERROR] Authentication token refresh failed: StatusCode %v", httpRes.StatusCode)
+			return fmt.Errorf("authentication token refresh failed, status code: %v", httpRes.StatusCode)
 		}
 		if len(bodyBytes) > 0 {
 			if ok := client.Backoff(attempts); !ok {
-				log.Printf("[ERROR] Authentication failed: Invalid credentials")
-				return fmt.Errorf("authentication failed, invalid credentials")
+				log.Printf("[ERROR] Authentication token refresh failed: Invalid credentials")
+				return fmt.Errorf("authentication token refresh failed, invalid credentials")
 			} else {
-				log.Printf("[ERROR] Authentication failed: %s, retries: %v", err, attempts)
+				log.Printf("[ERROR] Authentication token refresh failed: %s, retries: %v", err, attempts)
 				continue
 			}
 		}
-		client.AuthToken = httpRes.Header.Get("X-auth-access-token")
-		client.RefreshToken = httpRes.Header.Get("X-auth-refresh-token")
+
+		client.authToken = httpRes.Header.Get("X-auth-access-token")
+		client.refreshToken = httpRes.Header.Get("X-auth-refresh-token")
 		client.LastRefresh = time.Now()
 		client.RefreshCount = client.RefreshCount + 1
 		client.DomainUUID = httpRes.Header.Get("DOMAIN_UUID")
-		log.Printf("[DEBUG] Refresh successful")
+
+		log.Printf("[DEBUG] Authentication token refresh successful")
 		return nil
 	}
 }
 
-// Login if no token available.
-func (client *Client) Authenticate() error {
-	// cdFMC uses fixed token, no need to do separate authentication
+// AuthToken returns the current token
+func (client *Client) AuthToken() string {
+	client.authenticationMutex.RLock()
+	defer client.authenticationMutex.RUnlock()
+
+	return client.authToken
+}
+
+// Authenticate assures the token is there and valid.
+// It will try to login/refresh the token based on the current state and information
+// from FMC on failures (no proactive reauthentications).
+// currentAuthToken is the token used in the request. This helps to
+// determine, if authToken needs refreshing or has already been refreshed by other thread.
+// currentAuthToken can be an empty string.
+func (client *Client) Authenticate(currentAuthToken string) error {
+	// cdFMC uses fixed token to authenticate
 	if client.IsCDFMC {
 		return nil
 	}
 
-	var err error
 	client.authenticationMutex.Lock()
-	// Check if we can attempt to refresh the token (there is old token, it's between 25 and 29 minutes since last refresh, and less than 3 refreshes done)
-	if client.AuthToken != "" && time.Since(client.LastRefresh) > 1500*time.Second && time.Since(client.LastRefresh) < 1740*time.Second && client.RefreshCount < 3 {
-		err = client.Refresh()
-		// Check if we need to login (no token available or more than 25 minutes since last refresh)
-	} else if client.AuthToken == "" || time.Since(client.LastRefresh) >= 1500*time.Second {
-		err = client.Login()
+	defer client.authenticationMutex.Unlock()
+
+	if client.authToken != "" && currentAuthToken == "" {
+		// authToken is present, no error reported, do nothing
+		return nil
 	}
-	client.authenticationMutex.Unlock()
+
+	if currentAuthToken != "" && currentAuthToken != client.authToken {
+		// authToken has changed since the last request
+		// we assume some other thread has already refreshed it, do nothing
+		return nil
+	}
+
+	if client.authToken == "" {
+		// No authToken, do a full login
+		return client.login()
+	}
+
+	// We have the tokens, but FMC rejected them
+	// first check if we can refresh the tokens
+	err := client.refresh()
+	if err != nil {
+		// If refresh fails, do a full login
+		err = client.login()
+	}
+
 	return err
 }
 
